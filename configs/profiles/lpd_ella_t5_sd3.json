@@ -1,0 +1,5 @@
+{
+  "name": "lpd_ella_t5_sd3",
+  "entry_module": "scripts.train.lpd_ella_t5_sd3",
+  "default_args": []
+}

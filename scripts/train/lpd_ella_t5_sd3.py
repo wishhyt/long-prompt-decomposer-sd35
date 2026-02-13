@@ -30,6 +30,7 @@ import contextlib
 import copy
 import functools
 import gc
+import io
 import logging
 import math
 import os
@@ -48,13 +49,14 @@ import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed, DataLoaderConfiguration
-from datasets import load_dataset, interleave_datasets
+from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+from typing import Optional, Set
 
 import diffusers
 from diffusers import (
@@ -79,10 +81,17 @@ if is_wandb_available():
 logger = get_logger(__name__)
 
 
+def _prompt_to_text(prompt):
+    if isinstance(prompt, list):
+        return " ".join(prompt)
+    return prompt
+
+
 def log_validation(decomposer, caption2embed_simple, transformer, vae, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3, args, accelerator, weight_dtype, epoch, return_mask=False):
+    validation_prompt = _prompt_to_text(args.validation_prompt)
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
-        f" {args.validation_prompt}."
+        f" {validation_prompt}."
     )
     # create pipeline (note: unet and vae are loaded again in float32)
     pipeline = PromptDecomposePipeline.from_pretrained(
@@ -108,12 +117,12 @@ def log_validation(decomposer, caption2embed_simple, transformer, vae, text_enco
     images = []
     compose_image = []
     if torch.backends.mps.is_available():
-        autocast_ctx = nullcontext()
+        autocast_ctx = contextlib.nullcontext()
     else:
         autocast_ctx = torch.autocast(accelerator.device.type)
 
     with torch.no_grad():
-        captions = ["", args.validation_prompt]
+        captions = ["", validation_prompt]
         encoder_hidden_states_pre = caption2embed_simple(captions)
         # encoder_hidden_states_clip = encoder_hidden_states_pre['encoder_hidden_states_clip_concat']
         encoder_hidden_states_t5 = encoder_hidden_states_pre["encoder_hidden_states_t5"]
@@ -156,7 +165,7 @@ def log_validation(decomposer, caption2embed_simple, transformer, vae, text_enco
             tracker.log(
                 {
                     "compose": [
-                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(compose_image)
+                        wandb.Image(image, caption=f"{i}: {validation_prompt}") for i, image in enumerate(compose_image)
                     ],
                     "decompose": [
                         wandb.Image(image, caption=f"Component {i}") for i, image in enumerate(images)
@@ -251,7 +260,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_tokens",
         type=int,
-        default=64,
+        default=128,
         help="How many learnable tokens in resampler.",
     )
     parser.add_argument(
@@ -278,14 +287,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--decomposer_width",
         type=int,
-        default=1024,
-        help="Decomposer hidden dimension.",
+        default=None,
+        help="Decomposer hidden dimension. Defaults to text_encoder_3 hidden size for SD3.5.",
     )
     parser.add_argument(
         "--decomposer_heads",
         type=int,
-        default=8,
-        help="The rank of the LoRA projection matrix.",
+        default=32,
+        help="Number of decomposer attention heads.",
     )
     parser.add_argument(
         "--decomposer_layers",
@@ -416,7 +425,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataloader_num_workers",
         type=int,
-        default=8,
+        default=0,
         help=(
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
@@ -508,7 +517,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--dataset_name",
         type=str,
-        default=None,
+        default="luping-liu/LongAlign",
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
@@ -526,10 +535,62 @@ def parse_args(input_args=None):
         type=str,
         default=None,
         help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+            "Fallback local dataset folder for `imagefolder` format. Ignored when `dataset_name` is provided."
         ),
+    )
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default="train",
+        help="Dataset split to use.",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=True,
+        help="Load dataset in streaming mode (recommended for large datasets).",
+    )
+    parser.add_argument(
+        "--no_streaming",
+        action="store_false",
+        dest="streaming",
+        help="Disable streaming mode.",
+    )
+    parser.add_argument(
+        "--image_root",
+        type=str,
+        default=None,
+        help="Root directory for image files when dataset rows contain relative paths (e.g., LongAlign `path`).",
+    )
+    parser.add_argument(
+        "--path_column",
+        type=str,
+        default="path",
+        help="Column containing relative image paths.",
+    )
+    parser.add_argument(
+        "--source_column",
+        type=str,
+        default="source",
+        help="Column containing source name (used by `--source_filter`).",
+    )
+    parser.add_argument(
+        "--source_filter",
+        type=str,
+        default="coco",
+        help="Comma-separated sources to keep, e.g. `coco` or `coco,llava`. Use `*` to disable filtering.",
+    )
+    parser.add_argument(
+        "--skip_missing_images",
+        action="store_true",
+        default=True,
+        help="Skip missing/corrupt images instead of failing.",
+    )
+    parser.add_argument(
+        "--no_skip_missing_images",
+        action="store_false",
+        dest="skip_missing_images",
+        help="Fail on missing/corrupt images.",
     )
     parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
@@ -537,7 +598,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--caption_column",
         type=str,
-        default="text",
+        default="caption",
         help="The column of the dataset containing a caption or a list of captions.",
     )
     parser.add_argument(
@@ -559,11 +620,8 @@ def parse_args(input_args=None):
         "--validation_prompt",
         type=str,
         default="A sea turtle close up side view in the ocean water is swimming with a background of large boulder rocks. In the background are a few different breeds of small fish swimming in the opposite direction of the sea turtle. There is a bigger fish, which is blue-grey in color, with a sleek body shape, swimming in the upper right part of the image where the tail and mid-body are in view to the right. The sea turtle, which looks old, has light hitting the back of its shell, suggesting an outdoor setting with natural light. The image is backlit, with the lighting being soft, creating a calm and serene underwater atmosphere. The background features large boulder rocks and various small fish swimming in the ocean, with a larger fish partially visible to the right. The lighting highlights the sea turtle's shell, adding depth to the underwater scene. The style of the image is a realistic photo. The sea turtle in close-up side view is positioned in the foreground, with the large boulder rocks in the background behind it. The small fish swimming in the background are located further away from the sea turtle, moving in the opposite direction. The bigger fish with tail and mid-body in view is situated to the right of the sea turtle, with its body partially obscured by the rocks.",
-        nargs="+",
         help=(
-            "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
-            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
-            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
+            "Validation prompt evaluated every `--validation_steps` and logged to trackers."
         ),
     )
     parser.add_argument(
@@ -581,6 +639,30 @@ def parse_args(input_args=None):
             " `args.validation_prompt` multiple times: `args.num_validation_images`"
             " and logging the images."
         ),
+    )
+    parser.add_argument(
+        "--num_update_steps_per_epoch",
+        type=int,
+        default=1000,
+        help="Virtual epoch length for iterable/streaming datasets.",
+    )
+    parser.add_argument(
+        "--tracker_project_name",
+        type=str,
+        default="lpd_sd3",
+        help="Tracker project name (W&B project when `--report_to wandb`).",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Optional W&B run name.",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="Optional W&B entity/team name.",
     )
 
     if input_args is not None:
@@ -767,8 +849,106 @@ def clip_encode_prompt(
     return clip_prompt_embeds, pooled_prompt_embeds
 
 
+class LongCaptionIterableDataset(torch.utils.data.IterableDataset):
+    def __init__(
+        self,
+        dataset,
+        transform,
+        caption_column: str,
+        image_column: str,
+        path_column: str,
+        source_column: str,
+        source_filter: Optional[Set[str]],
+        image_root: Optional[str],
+        skip_missing_images: bool,
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.transform = transform
+        self.caption_column = caption_column
+        self.image_column = image_column
+        self.path_column = path_column
+        self.source_column = source_column
+        self.source_filter = source_filter
+        self.image_root = image_root
+        self.skip_missing_images = skip_missing_images
+
+    def set_epoch(self, epoch: int):
+        if hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+
+    def _get_caption(self, example):
+        for key in [self.caption_column, "captions", "caption", "text", "prompt"]:
+            if key in example and example[key] is not None:
+                value = example[key]
+                if isinstance(value, (list, tuple)):
+                    return str(random.choice(value)) if value else ""
+                return str(value)
+        return None
+
+    def _load_image(self, example):
+        image = example.get(self.image_column)
+        if isinstance(image, Image.Image):
+            return image
+        if isinstance(image, dict):
+            if image.get("bytes") is not None:
+                return Image.open(io.BytesIO(image["bytes"]))
+            if image.get("path"):
+                return Image.open(image["path"])
+
+        candidate_paths = []
+        if "image_path" in example and example["image_path"]:
+            candidate_paths.append(str(example["image_path"]))
+        if self.path_column in example and example[self.path_column]:
+            rel_path = str(example[self.path_column])
+            candidate_paths.append(rel_path)
+            if self.image_root:
+                candidate_paths.append(os.path.join(self.image_root, rel_path))
+
+        for path in candidate_paths:
+            if os.path.isfile(path):
+                return Image.open(path)
+
+        raise FileNotFoundError(f"Could not resolve image path for sample: {candidate_paths}")
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            dataset_iter = iter(self.dataset)
+        elif hasattr(self.dataset, "shard"):
+            dataset_iter = iter(self.dataset.shard(num_shards=worker_info.num_workers, index=worker_info.id))
+        else:
+            # Fallback sharding for iterables that do not implement `.shard`.
+            def _manual_shard():
+                for idx, item in enumerate(self.dataset):
+                    if idx % worker_info.num_workers == worker_info.id:
+                        yield item
+
+            dataset_iter = _manual_shard()
+
+        for example in dataset_iter:
+            if self.source_filter is not None:
+                source = str(example.get(self.source_column, "")).lower()
+                if source not in self.source_filter:
+                    continue
+
+            caption = self._get_caption(example)
+            if caption is None:
+                continue
+
+            try:
+                image = self._load_image(example)
+                pixel_values = self.transform(image.convert("RGB"))
+            except Exception:
+                if self.skip_missing_images:
+                    continue
+                raise
+
+            yield {"pixel_values": pixel_values, "captions": caption}
+
+
 def main(args):
-    if args.report_to == "wandb" and args.hub_token is not None:
+    if args.report_to in {"wandb", "all"} and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
             " Please use `hf auth login` to authenticate with the Hub."
@@ -786,7 +966,7 @@ def main(args):
         dataloader_config=dataloader_config,
     )
 
-    if args.report_to == "wandb":
+    if args.report_to in {"wandb", "all"}:
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
 
@@ -870,6 +1050,18 @@ def main(args):
     transformer = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
+    t5_hidden_size = text_encoder_three.config.d_model
+    if args.decomposer_width is None:
+        args.decomposer_width = t5_hidden_size
+    if args.decomposer_width != t5_hidden_size:
+        raise ValueError(
+            f"`--decomposer_width` must match text_encoder_3 hidden size ({t5_hidden_size}) for this script; "
+            f"got {args.decomposer_width}."
+        )
+    if args.decomposer_width % args.decomposer_heads != 0:
+        raise ValueError(
+            f"`--decomposer_width` ({args.decomposer_width}) must be divisible by `--decomposer_heads` ({args.decomposer_heads})."
+        )
     decomposer = TextDecomposer(
         width=args.decomposer_width,
         heads=args.decomposer_heads,
@@ -922,7 +1114,6 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = list(decomposer.parameters()) + [p for n, p in transformer.named_parameters() if p.requires_grad],
     optimizer = optimizer_class(
         decomposer.parameters(),
         lr=args.learning_rate,
@@ -939,63 +1130,69 @@ def main(args):
     transformer.to(accelerator.device, dtype=weight_dtype)
     decomposer.to(accelerator.device)
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-    if "JourneyDB" in args.train_data_dir:
-        # base_url = "https://huggingface.co/datasets/JourneyDB/JourneyDB/resolve/main/data/train/imgs/{i:03d}.tgz"
-        # urls = [base_url.format(i=i) for i in range(200)]
-        # train_dataset_jdb = load_dataset("webdataset", data_files={"train": urls}, split="train", streaming=True)
-        train_dataset_jdb = load_dataset(
-            '//data/JourneyDB',
-            cache_dir="//data/JourneyDB/.cache",
-            split="train",
-            trust_remote_code=True,
-            streaming=True,
-        ).shuffle(seed=args.seed, buffer_size=10)
-    if "coco" in args.train_data_dir:
-        # train_dataset_coco = load_dataset(
-        #     "webdataset",
-        #     data_files={"train": '//data/coco2017/train2017.zip'},
-        #     split="train"
-        # ).to_iterable_dataset(num_shards=200)
-        train_dataset_coco = load_dataset(
-            '//data/coco2017',
-            cache_dir=f"//data/coco2017/.cache",
-            split="train",
-            trust_remote_code=True,
-        ).to_iterable_dataset(num_shards=200).shuffle(seed=args.seed, buffer_size=10)
-    if "llava" in args.train_data_dir:
-        # train_dataset_lcs = load_dataset(
-        #     "webdataset",
-        #     data_files={"train": '//data/LLaVA-Pretrain/images.zip'},
-        #     split="train"
-        # ).to_iterable_dataset(num_shards=200)
-        train_dataset_lcs = load_dataset(
-            '//data/LLaVA-Pretrain',
-            cache_dir=f"//data/LLaVA-Pretrain/.cache",
-            split="train",
-            trust_remote_code=True,
-        ).to_iterable_dataset(num_shards=200).shuffle(seed=args.seed, buffer_size=10)
-    if "sam" in args.train_data_dir:
-        # train_dataset_sam = load_dataset(
-        #     '//data/sa-1b',
-        #     split="train",
-        #     trust_remote_code=True,
-        #     streaming=True,
-        # ).shuffle(seed=args.seed, buffer_size=10)
-        train_dataset_sam = load_dataset(
-            '//data/sa-1b',
-            cache_dir=f"//data/sa-1b/.cache",
-            split="train",
-            trust_remote_code=True,
-        ).to_iterable_dataset(num_shards=200).shuffle(seed=args.seed, buffer_size=10)
-    
+    if args.dataset_name is None and args.train_data_dir is None:
+        raise ValueError("Pass either `--dataset_name` or `--train_data_dir`.")
+
+    if args.dataset_name is not None:
+        local_dataset_dir = Path(args.dataset_name)
+        if local_dataset_dir.exists() and local_dataset_dir.is_dir():
+            parquet_files = sorted(str(path) for path in local_dataset_dir.rglob("*.parquet"))
+            if parquet_files:
+                raw_train_dataset = load_dataset(
+                    "parquet",
+                    data_files=parquet_files,
+                    split=args.dataset_split,
+                    cache_dir=args.cache_dir,
+                    streaming=args.streaming,
+                )
+            else:
+                raw_train_dataset = load_dataset(
+                    args.dataset_name,
+                    args.dataset_config_name,
+                    split=args.dataset_split,
+                    cache_dir=args.cache_dir,
+                    streaming=args.streaming,
+                )
+        else:
+            raw_train_dataset = load_dataset(
+                args.dataset_name,
+                args.dataset_config_name,
+                split=args.dataset_split,
+                cache_dir=args.cache_dir,
+                streaming=args.streaming,
+            )
+    else:
+        raw_train_dataset = load_dataset(
+            "imagefolder",
+            data_dir=args.train_data_dir,
+            split=args.dataset_split,
+            cache_dir=args.cache_dir,
+            streaming=args.streaming,
+        )
+
+    if args.max_train_samples is not None:
+        if args.streaming:
+            raw_train_dataset = raw_train_dataset.take(args.max_train_samples)
+        else:
+            max_samples = min(args.max_train_samples, len(raw_train_dataset))
+            raw_train_dataset = raw_train_dataset.shuffle(seed=args.seed).select(range(max_samples))
+
+    source_filter = None
+    if args.source_filter and args.source_filter.strip() and args.source_filter.strip() != "*":
+        source_filter = {item.strip().lower() for item in args.source_filter.split(",") if item.strip()}
+
     tokenizers = [(tokenizer_one, tokenizer_two), tokenizer_three]
     text_encoders = [(text_encoder_one, text_encoder_two), text_encoder_three]
-    caption2embed_simple = lambda captions: caption2embed_sd3(captions, [None, tokenizer_three], [None, text_encoder_three],
-                                                          accelerator.device, weight_dtype, args=args, token_length=args.token_length)
+    caption2embed_simple = lambda captions: caption2embed_sd3(
+        captions,
+        [None, tokenizer_three],
+        [None, text_encoder_three],
+        accelerator.device,
+        weight_dtype,
+        args=args,
+        token_length=args.token_length,
+    )
 
-    # preprocess
     train_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -1004,34 +1201,24 @@ def main(args):
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-    def preprocess_train(examples):
-        if len(examples['image_path']) > 0:
-            examples['pixel_values'] = Image.open(examples['image_path'])
-        examples["pixel_values"] = train_transforms(
-            examples['pixel_values'].convert("RGB")
-        )
-        return examples
 
-    # probs = [0.3, 0.2, 0.25, 0.25]
-    probs = [0.4, 0.10, 0.25, 0.25]
-    # probs = [0.5, 0.05, 0.20, 0.25]
-    # probs = [0.6, 0.05, 0.15, 0.20]
-    train_dataset = interleave_datasets(
-        [train_dataset_jdb, train_dataset_coco, train_dataset_lcs, train_dataset_sam],
-        probabilities=probs,
-        seed=args.seed,
-        stopping_strategy='all_exhausted',
+    train_dataset = LongCaptionIterableDataset(
+        dataset=raw_train_dataset,
+        transform=train_transforms,
+        caption_column=args.caption_column,
+        image_column=args.image_column,
+        path_column=args.path_column,
+        source_column=args.source_column,
+        source_filter=source_filter,
+        image_root=args.image_root,
+        skip_missing_images=args.skip_missing_images,
     )
-    train_dataset = train_dataset.map(preprocess_train)
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-        captions = [example['captions'] if random.random() >= args.component_dropout else '' for example in examples]
-        return {
-            "pixel_values": pixel_values,
-            "captions": captions,
-        }
+        captions = [example["captions"] if random.random() >= args.component_dropout else "" for example in examples]
+        return {"pixel_values": pixel_values, "captions": captions}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -1040,9 +1227,20 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
+    try:
+        first_batch = next(iter(train_dataloader))
+        logger.info(
+            "Loaded first batch successfully: pixel_values shape=%s",
+            tuple(first_batch["pixel_values"].shape),
+        )
+    except StopIteration as exc:
+        raise RuntimeError(
+            "No valid training samples found. Check `--image_root`, `--source_filter`, and dataset columns."
+        ) from exc
+
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = 20000
+    num_update_steps_per_epoch = args.num_update_steps_per_epoch
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -1067,15 +1265,36 @@ def main(args):
         # Afterwards we recalculate our number of training epochs
         args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
+    def save_decomposer_weights(save_dir: str):
+        os.makedirs(save_dir, exist_ok=True)
+        state_dict = {
+            key: value.detach().cpu()
+            for key, value in unwrap_model(decomposer).state_dict().items()
+        }
+        save_file(state_dict, os.path.join(save_dir, "model.safetensors"))
+
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
 
         # tensorboard cannot handle list types for config
-        tracker_config.pop("validation_prompt")
+        tracker_config.pop("validation_prompt", None)
 
-        accelerator.init_trackers("lpd_sd3", config=tracker_config)
+        init_kwargs = {}
+        if args.report_to in {"wandb", "all"}:
+            wandb_kwargs = {}
+            if args.wandb_run_name:
+                wandb_kwargs["name"] = args.wandb_run_name
+            if args.wandb_entity:
+                wandb_kwargs["entity"] = args.wandb_entity
+            if wandb_kwargs:
+                init_kwargs["wandb"] = wandb_kwargs
+
+        if init_kwargs:
+            accelerator.init_trackers(args.tracker_project_name, config=tracker_config, init_kwargs=init_kwargs)
+        else:
+            accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
@@ -1139,9 +1358,12 @@ def main(args):
 
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
-        train_dataset.set_epoch(epoch)
+        if hasattr(train_dataset, "set_epoch"):
+            train_dataset.set_epoch(epoch)
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(decomposer):
+                kd_loss = None
+                diff_loss = None
                 with torch.no_grad():
                     # Convert images to latent space
                     pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
@@ -1279,6 +1501,7 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        save_decomposer_weights(save_path)
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
@@ -1286,10 +1509,11 @@ def main(args):
                             decomposer, caption2embed_simple, transformer, vae, text_encoder_one, text_encoder_two, text_encoder_three, tokenizer_one, tokenizer_two, tokenizer_three, args, accelerator, weight_dtype, epoch
                         )
 
-            logs = {
-                # "loss": kd_loss.detach().item(),
-                "diff": diff_loss.detach().item(),
-                "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if diff_loss is not None:
+                logs["diff"] = diff_loss.detach().item()
+            if kd_loss is not None:
+                logs["kd"] = kd_loss.detach().item()
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -1298,6 +1522,9 @@ def main(args):
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        save_decomposer_weights(args.output_dir)
+        logger.info(f"Saved final decomposer weights to {os.path.join(args.output_dir, 'model.safetensors')}")
     accelerator.end_training()
 
 
