@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Packaging / env
+.venv/
+venv/
+env/
+.python-version
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Experiment artifacts
+wandb/
+logs/
+outputs/
+checkpoints/
+*.out
+*.log
+*.tmp
+
+# Data / model caches
+.cache/
+.hf/
+.huggingface/

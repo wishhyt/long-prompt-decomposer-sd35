@@ -1,0 +1,5 @@
+{
+  "name": "lpd_ella_ct5",
+  "entry_module": "scripts.train.lpd_ella_ct5",
+  "default_args": []
+}
